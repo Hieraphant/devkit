@@ -1,6 +1,9 @@
 package runners
 
-import "context"
+import (
+	"context"
+	"os"
+)
 
 type RunResult struct {
 	Output    string
@@ -17,6 +20,10 @@ type RunOpts struct {
 	AppendSystemPromptFile string
 	AppendSystemPrompt     string
 	MaxTurns               int
+	// Env holds extra KEY=VALUE pairs appended to the inherited environment
+	// of a spawned CLI. devkit_ask uses it to pass DEVKIT_ASK_DEPTH down the
+	// process tree so a peer it launched cannot launch another.
+	Env []string
 }
 
 type Runner interface {
@@ -49,6 +56,17 @@ func FindRunner(name string, runners []Runner) Runner {
 		}
 	}
 	return nil
+}
+
+// childEnv returns the environment for a spawned CLI: nil (inherit the
+// parent environment unchanged) when opts.Env is empty, otherwise the
+// parent environment with opts.Env appended. exec.Cmd keeps the last value
+// for a duplicated key, so entries in opts.Env override inherited ones.
+func childEnv(opts RunOpts) []string {
+	if len(opts.Env) == 0 {
+		return nil
+	}
+	return append(os.Environ(), opts.Env...)
 }
 
 // TruncStr truncates a string to n runes with "..." suffix.
