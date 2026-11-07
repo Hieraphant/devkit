@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -880,12 +882,32 @@ func tailString(s string, n int) string {
 	return "…" + s[len(s)-n:]
 }
 
+// askMaxDepth bounds devkit_ask nesting. The handler refuses to run when
+// DEVKIT_ASK_DEPTH in its own environment has reached the limit, and it
+// launches every peer with DEVKIT_ASK_DEPTH incremented, so a peer that
+// has the devkit MCP server loaded cannot ask onward and two hosts cannot
+// ping-pong until the timeout fires.
+const askMaxDepth = 1
+
+// askDepthEnv carries the devkit_ask nesting depth down the process tree:
+// MCP server → peer CLI → that peer's own devkit MCP server.
+const askDepthEnv = "DEVKIT_ASK_DEPTH"
+
+// askMaxTimeout caps the optional devkit_ask timeout argument. The default
+// when the argument is omitted is commandTimeout.
+const askMaxTimeout = 30 * time.Minute
+
+// askDetectRunners is the peer discovery used by devkit_ask; tests swap it
+// to inject fake peers.
+var askDetectRunners = runners.DetectRunners
+
 func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 	tool := mcpmcp.NewTool("devkit_ask",
-		mcpmcp.WithDescription("Send a prompt to a peer AI CLI (claude, codex, or agy) and return its answer synchronously. The direct, commutative bridge primitive: any MCP host can ask any peer and block for the reply."),
+		mcpmcp.WithDescription("Send a prompt to a peer AI CLI (claude, codex, or agy) and return its answer synchronously. The direct, commutative bridge primitive: any MCP host can ask any peer and block for the reply. Nesting is refused: a peer launched by devkit_ask cannot call devkit_ask itself."),
 		mcpmcp.WithString("to", mcpmcp.Required(), mcpmcp.Description("Target peer: claude, codex, or agy")),
 		mcpmcp.WithString("prompt", mcpmcp.Required(), mcpmcp.Description("The prompt to send to the peer")),
-		mcpmcp.WithString("workdir", mcpmcp.Description("Working directory for the peer (optional)")),
+		mcpmcp.WithString("workdir", mcpmcp.Description("Working directory for the peer (optional; must be an existing directory)")),
+		mcpmcp.WithNumber("timeout", mcpmcp.Description(fmt.Sprintf("Seconds to wait for the peer's answer (optional; default %d, max %d)", int(commandTimeout.Seconds()), int(askMaxTimeout.Seconds())))),
 	)
 	return tool, func(ctx context.Context, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
 		to, err := req.RequireString("to")
@@ -895,12 +917,6 @@ func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		prompt, err := req.RequireString("prompt")
 		if err != nil {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("missing argument: %v", err)), nil
-		}
-		workdir := ""
-		if args := req.GetArguments(); args != nil {
-			if w, ok := args["workdir"].(string); ok {
-				workdir = w
-			}
 		}
 
 		to = strings.ToLower(strings.TrimSpace(to))
@@ -912,18 +928,46 @@ func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("unknown peer %q: want claude, codex, or agy", to)), nil
 		}
 
-		peer := runners.FindRunner(to, runners.DetectRunners())
+		// Validate every argument before touching PATH or spawning anything.
+		workdir := strings.TrimSpace(req.GetString("workdir", ""))
+		if workdir != "" {
+			info, statErr := os.Stat(workdir)
+			if statErr != nil {
+				return mcpmcp.NewToolResultError(fmt.Sprintf("workdir %q: %v", workdir, statErr)), nil
+			}
+			if !info.IsDir() {
+				return mcpmcp.NewToolResultError(fmt.Sprintf("workdir %q is not a directory", workdir)), nil
+			}
+		}
+		timeout, err := askTimeout(req)
+		if err != nil {
+			return mcpmcp.NewToolResultError(err.Error()), nil
+		}
+		depth, err := askDepth()
+		if err != nil {
+			return mcpmcp.NewToolResultError(err.Error()), nil
+		}
+
+		peer := runners.FindRunner(to, askDetectRunners())
 		if peer == nil {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("peer %q is not available — check it is installed and on PATH", to)), nil
 		}
 
 		// Bound the synchronous call so a wedged peer cannot hang the MCP
 		// request forever; parent cancellation still propagates.
-		ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		res, runErr := peer.Run(ctx, prompt, runners.RunOpts{WorkDir: workdir})
+		res, runErr := peer.Run(ctx, prompt, runners.RunOpts{
+			WorkDir: workdir,
+			// The peer (and any devkit MCP server it loads) sees the
+			// incremented depth and refuses to ask further.
+			Env: []string{fmt.Sprintf("%s=%d", askDepthEnv, depth+1)},
+		})
 		if runErr != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return mcpmcp.NewToolResultError(fmt.Sprintf("%s timed out after %s", to, timeout)), nil
+			}
 			// Surface exit code + whatever the peer produced so the caller
 			// sees the real failure, not just the Go wrapper message.
 			detail := res.Output
@@ -936,4 +980,44 @@ func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		}
 		return mcpmcp.NewToolResultText(res.Output), nil
 	}
+}
+
+// askTimeout resolves the optional timeout argument (seconds) to a
+// duration: commandTimeout when omitted, otherwise a positive value no
+// larger than askMaxTimeout.
+func askTimeout(req mcpmcp.CallToolRequest) (time.Duration, error) {
+	raw, present := req.GetArguments()["timeout"]
+	if !present || raw == nil {
+		return commandTimeout, nil
+	}
+	secs, err := req.RequireFloat("timeout")
+	if err != nil {
+		return 0, fmt.Errorf("invalid timeout: %v", err)
+	}
+	if math.IsNaN(secs) || math.IsInf(secs, 0) || secs <= 0 {
+		return 0, fmt.Errorf("invalid timeout %v: must be a positive number of seconds", secs)
+	}
+	// Compare before converting so an absurd value cannot overflow Duration.
+	if secs > askMaxTimeout.Seconds() {
+		return 0, fmt.Errorf("timeout %vs exceeds maximum %ds", secs, int(askMaxTimeout.Seconds()))
+	}
+	return time.Duration(secs * float64(time.Second)), nil
+}
+
+// askDepth reads DEVKIT_ASK_DEPTH from this process's environment and
+// refuses once the limit is reached. A malformed value is refused too:
+// it means something upstream tampered with the guard.
+func askDepth() (int, error) {
+	raw := strings.TrimSpace(os.Getenv(askDepthEnv))
+	if raw == "" {
+		return 0, nil
+	}
+	depth, err := strconv.Atoi(raw)
+	if err != nil || depth < 0 {
+		return 0, fmt.Errorf("invalid %s=%q: expected a non-negative integer", askDepthEnv, raw)
+	}
+	if depth >= askMaxDepth {
+		return 0, fmt.Errorf("nested devkit_ask refused (%s=%d): a peer launched by devkit_ask may not ask another peer", askDepthEnv, depth)
+	}
+	return depth, nil
 }
