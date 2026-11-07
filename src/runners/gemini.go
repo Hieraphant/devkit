@@ -29,6 +29,7 @@ func (r *GeminiRunner) Run(ctx context.Context, prompt string, opts RunOpts) (Ru
 	if opts.WorkDir != "" {
 		cmd.Dir = opts.WorkDir
 	}
+	cmd.Env = childEnv(opts)
 
 	cmd.Stdin = strings.NewReader(prompt)
 

@@ -32,6 +32,7 @@ func (r *CodexRunner) Run(ctx context.Context, prompt string, opts RunOpts) (Run
 	if opts.WorkDir != "" {
 		cmd.Dir = opts.WorkDir
 	}
+	cmd.Env = childEnv(opts)
 	cmd.Stdin = strings.NewReader(prompt)
 
 	var stdout, stderr bytes.Buffer

@@ -347,7 +347,7 @@ MCP Server (bin/devkit mcp — auto-started by plugin)
   │       verifies SHA256, caches as bin/devkit-engine-v<ver>-<os>-<arch>,
   │       then execs it. Local dev builds (make install-plugin) are used
   │       directly via the fast path.
-  ├── Tools: devkit_start, devkit_advance, devkit_status, devkit_list
+  ├── Tools: devkit_start, devkit_advance, devkit_status, devkit_list, devkit_ask
   ├── State: session.json (hot, <50ms reads) + SQLite (cold history)
   ├── Parse YAML → validate steps, branches, budget
   ├── Walk steps:
@@ -367,7 +367,7 @@ Enforcement:
   └── External adapters: host-specific hooks/proxies enforce what their host exposes
 
 Terminal usage (devkit workflow <name> "<description>"):
-  ├── Subprocess runners for Codex/Gemini CLI
+  ├── Subprocess runners for Codex/Gemini/agy CLI
   └── In-process HTTP runner for Ollama/llama-server/vLLM (opt-in via DEVKIT_LOCAL_ENABLED=1)
 ```
 
@@ -386,7 +386,7 @@ devkit/
 ├── src/               # Go engine + MCP server
 │   ├── mcp/           # MCP server (tools, principles loader, session management)
 │   ├── engine/        # YAML workflow engine (parser, executor, tests)
-│   ├── runners/       # Claude/Codex/Gemini CLI interfaces + local HTTP runner (Ollama-compat, opt-in)
+│   ├── runners/       # Claude/Codex/Gemini/agy CLI interfaces + local HTTP runner (Ollama-compat, opt-in)
 │   ├── lib/           # DB, git, metrics, session state, reporting
 │   └── cmd/           # CLI entry points (including `devkit mcp`)
 ├── bin/               # devkit wrapper (committed) + downloaded engine binaries (gitignored)

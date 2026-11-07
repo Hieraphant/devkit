@@ -1,13 +1,14 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,13 @@ const commandTimeout = 5 * time.Minute
 // gateTimeout bounds each loop gate independently so a wedged gate
 // cannot consume the full commandTimeout budget.
 const gateTimeout = 60 * time.Second
+
+// commandWaitDelay bounds how long we keep reading output after the shell
+// exits or is killed. Without it, a child that inherited the output pipe
+// blocks the step until the child exits, ignoring the timeout (#126).
+// Output still open after this delay is treated as incomplete.
+// A var so tests can shorten it.
+var commandWaitDelay = 5 * time.Second
 
 // sessionStaleTTL is the age after which an existing "running" session
 // is considered orphaned — i.e. the previous engine process crashed
@@ -126,7 +134,11 @@ func (s *Server) startTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		// window will also correctly report "no active session" until
 		// we publish the transition to "running" below.
 		sessionID := lib.NewSessionID()
-		firstStep := wf.Steps[0]
+		firstIdx := wf.NextIndex(0)
+		if firstIdx >= len(wf.Steps) {
+			return mcpmcp.NewToolResultError(fmt.Sprintf("workflow %q has no runnable steps (every step is a parallel child)", wfName)), nil
+		}
+		firstStep := wf.Steps[firstIdx]
 		var reclaimedNote string
 		state, err := lib.UpdateSessionJSON(s.dataDir, func(cur *lib.SessionState) (*lib.SessionState, error) {
 			if cur != nil && (cur.Status == "running" || cur.Status == "starting") {
@@ -158,7 +170,7 @@ func (s *Server) startTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 				Workflow:     wfName, // store filename, not wf.Name, to prevent traversal in advance
 				Input:        input,
 				CurrentStep:  firstStep.ID,
-				CurrentIndex: 0,
+				CurrentIndex: firstIdx,
 				TotalSteps:   len(wf.Steps),
 				StepType:     stepType(firstStep),
 				// StepEnforce is the current step's effective enforce,
@@ -291,8 +303,23 @@ func (s *Server) formatStepResponse(wf *engine.Workflow, state *lib.SessionState
 	} else if len(step.Parallel) > 0 {
 		fmt.Fprintf(&b, "TYPE: parallel dispatch\n")
 		fmt.Fprintf(&b, "DISPATCH: %s\n", strings.Join(step.Parallel, ", "))
-		fmt.Fprintf(&b, "Run each listed step concurrently through the host subagent facility, then call devkit_advance with a consolidated result.\n")
+		fmt.Fprintf(&b, "Run each listed step concurrently through the host subagent facility, then call devkit_advance with `outputs`: an object mapping every step id above to that subagent's result (e.g. {\"%s\": \"...\"}). If a subagent failed, report the failure text as its output. An optional `output` may carry a consolidated summary.\n", step.Parallel[0])
 		fmt.Fprintf(&b, "Use host-native subagents or external runners when available; give each subagent a bounded scope, separate write ownership, and require files changed, verification run, and remaining risks before completion.\n")
+		for _, cid := range step.Parallel {
+			child := findStep(wf, cid)
+			if child == nil {
+				continue
+			}
+			fmt.Fprintf(&b, "\n--- %s", cid)
+			if child.Model != "" {
+				fmt.Fprintf(&b, " (model: %s)", child.Model)
+			}
+			fmt.Fprintf(&b, " ---\nPROMPT: %s\n", engine.Interpolate(child.Prompt, input, state.Outputs))
+			if child.Require != nil {
+				fmt.Fprintf(&b, "REQUIRE (checked on this step's entry in outputs):\n")
+				writeRequire(&b, child.Require)
+			}
+		}
 	} else {
 		prompt := engine.Interpolate(step.Prompt, input, state.Outputs)
 		fmt.Fprintf(&b, "PROMPT: %s\n", prompt)
@@ -330,18 +357,7 @@ func (s *Server) formatStepResponse(wf *engine.Workflow, state *lib.SessionState
 	}
 	if step.Require != nil {
 		fmt.Fprintf(&b, "\nREQUIRE:\n")
-		if step.Require.NonEmpty {
-			fmt.Fprintf(&b, "- non_empty\n")
-		}
-		for _, want := range step.Require.Contains {
-			fmt.Fprintf(&b, "- contains: %s\n", want)
-		}
-		if step.Require.Until != "" {
-			fmt.Fprintf(&b, "- until: %s\n", step.Require.Until)
-		}
-		if step.Require.LastLineRegex != "" {
-			fmt.Fprintf(&b, "- last_line_regex: %s\n", step.Require.LastLineRegex)
-		}
+		writeRequire(&b, step.Require)
 	}
 
 	fmt.Fprintf(&b, "\nCall devkit_advance when this step is complete.\n")
@@ -353,6 +369,7 @@ func (s *Server) advanceTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		mcpmcp.WithDescription("Complete current step and get next"),
 		mcpmcp.WithString("session", mcpmcp.Required(), mcpmcp.Description("Session ID")),
 		mcpmcp.WithString("output", mcpmcp.Description("Summary of step output (for prompt steps)")),
+		mcpmcp.WithObject("outputs", mcpmcp.Description("Parallel dispatch steps only: object mapping each dispatched step id to its result")),
 	)
 	return tool, func(ctx context.Context, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
 		sessionID, err := req.RequireString("session")
@@ -422,6 +439,12 @@ func (s *Server) advanceTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 
 		currentStep := wf.Steps[state.CurrentIndex]
 
+		// freshOutput records whether this advance supplied the current
+		// step's output; loop until-sentinels only count when fresh, so
+		// a DONE from an earlier (gate-failed) iteration can't complete
+		// the loop later.
+		freshOutput := false
+
 		// Handle command steps — engine executes them. Command strings
 		// are run literally (no {{...}} expansion); values are passed
 		// through env vars DEVKIT_INPUT and DEVKIT_OUT_<step_id> to
@@ -459,9 +482,23 @@ func (s *Server) advanceTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 			if err := engine.ValidateRequiredOutput(currentStep, output); err != nil {
 				return mcpmcp.NewToolResultError(err.Error()), nil
 			}
+			if len(currentStep.Parallel) > 0 {
+				childOut, err := parallelOutputs(wf, currentStep, args["outputs"])
+				if err != nil {
+					return mcpmcp.NewToolResultError(err.Error()), nil
+				}
+				for id, out := range childOut {
+					state.Outputs[id] = out
+				}
+			}
 			if outputProvided || (currentStep.Require != nil && currentStep.Require.HasChecks()) {
 				state.Outputs[currentStep.ID] = output
+			} else {
+				// No output this visit: drop any value from an earlier
+				// visit so branch rules and {{id}} can't act on it.
+				delete(state.Outputs, currentStep.ID)
 			}
+			freshOutput = outputProvided
 		}
 
 		// Handle loop steps. Do NOT pre-release the claim here — if
@@ -471,55 +508,168 @@ func (s *Server) advanceTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		// writes with Busy=false, and the defer's follow-up write is
 		// a harmless no-op.
 		if currentStep.Loop != nil {
-			return s.handleLoopAdvance(ctx, wf, state, &currentStep, req)
+			return s.handleLoopAdvance(ctx, wf, state, &currentStep, freshOutput)
 		}
 
-		// Advance to next step
-		nextIndex := state.CurrentIndex + 1
+		return s.transition(wf, state, &currentStep, "")
+	}
+}
 
-		// Check branch conditions
-		if len(currentStep.Branch) > 0 {
-			if output, ok := state.Outputs[currentStep.ID]; ok {
-				target := engine.EvalBranch(output, currentStep.Branch)
-				if target != "" {
-					for i, step := range wf.Steps {
-						if step.ID == target {
-							nextIndex = i
-							break
-						}
+// writeRequire renders a require: contract as "- check" lines.
+func writeRequire(b *strings.Builder, r *engine.Require) {
+	if r.NonEmpty {
+		fmt.Fprintf(b, "- non_empty\n")
+	}
+	for _, want := range r.Contains {
+		fmt.Fprintf(b, "- contains: %s\n", want)
+	}
+	if r.Until != "" {
+		fmt.Fprintf(b, "- until: %s\n", r.Until)
+	}
+	if r.LastLineRegex != "" {
+		fmt.Fprintf(b, "- last_line_regex: %s\n", r.LastLineRegex)
+	}
+}
+
+// findStep returns the step with the given id, or nil.
+func findStep(wf *engine.Workflow, id string) *engine.WfStep {
+	for i := range wf.Steps {
+		if wf.Steps[i].ID == id {
+			return &wf.Steps[i]
+		}
+	}
+	return nil
+}
+
+// parallelOutputs validates the `outputs` argument for a parallel
+// dispatch step: it must be an object with a string entry for every
+// dispatched child and nothing else. Downstream prompts reference
+// children by id ({{review-a}}), so a single consolidated blob is not
+// enough.
+func parallelOutputs(wf *engine.Workflow, step engine.WfStep, raw any) (map[string]string, error) {
+	want := strings.Join(step.Parallel, ", ")
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("parallel step %s: pass `outputs` as an object mapping each dispatched step id (%s) to its result", step.ID, want)
+	}
+	allowed := make(map[string]bool, len(step.Parallel))
+	for _, id := range step.Parallel {
+		allowed[id] = true
+	}
+	for k := range obj {
+		if !allowed[k] {
+			return nil, fmt.Errorf("parallel step %s: unknown id %q in outputs (expected: %s)", step.ID, k, want)
+		}
+	}
+	out := make(map[string]string, len(step.Parallel))
+	var missing []string
+	for _, id := range step.Parallel {
+		v, ok := obj[id].(string)
+		if !ok {
+			missing = append(missing, id)
+			continue
+		}
+		out[id] = v
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("parallel step %s: outputs missing a string result for: %s", step.ID, strings.Join(missing, ", "))
+	}
+	// Children are skipped in the sequential walk, so their own
+	// require: contracts must be checked here.
+	for _, id := range step.Parallel {
+		if child := findStep(wf, id); child != nil {
+			if err := engine.ValidateRequiredOutput(*child, out[id]); err != nil {
+				return nil, fmt.Errorf("parallel step %s: %w", step.ID, err)
+			}
+		}
+	}
+	return out, nil
+}
+
+// transition moves the session past `step`: a matching branch rule
+// wins, otherwise `end: true` completes the workflow, otherwise the
+// walk continues at the next step that is not a parallel child. The
+// claim is cleared in the same write. notice is prepended to the
+// response (used for loop-exhaustion warnings).
+func (s *Server) transition(wf *engine.Workflow, state *lib.SessionState, step *engine.WfStep, notice string) (*mcpmcp.CallToolResult, error) {
+	nextIndex := -1
+	if len(step.Branch) > 0 {
+		if output, ok := state.Outputs[step.ID]; ok {
+			if target := engine.EvalBranch(output, step.Branch); target != "" {
+				for i := range wf.Steps {
+					if wf.Steps[i].ID == target {
+						nextIndex = i
+						break
 					}
 				}
 			}
 		}
-
-		if nextIndex >= len(wf.Steps) {
-			// Do NOT pre-release the claim — if completeWorkflow's
-			// initial WriteSessionJSON fails the session file still
-			// has Busy=true on disk and we need the deferred release
-			// to clean it up. On the success path completeWorkflow
-			// removes session.json via ClearSessionJSON, so the
-			// defer's UpdateSessionJSON finds nil and no-ops.
-			return s.completeWorkflow(state)
-		}
-
-		// Write next step state. Clear the claim as part of this same
-		// write so the common case is a single atomic transition; the
-		// deferred releaseClaim will then observe Busy=false and
-		// no-op. We do NOT set claimReleased=true here so the defer
-		// still runs on subsequent panics or added return paths.
-		nextStep := wf.Steps[nextIndex]
-		state.CurrentStep = nextStep.ID
-		state.CurrentIndex = nextIndex
-		state.StepType = stepType(nextStep)
-		state.StepEnforce = engine.EffectiveEnforce(*wf, nextStep)
-		state.Busy = false
-		if err := lib.WriteSessionJSON(s.dataDir, state); err != nil {
-			return mcpmcp.NewToolResultError(fmt.Sprintf("write state: %v", err)), nil
-		}
-
-		response := s.formatStepResponse(wf, state, &nextStep, state.Input)
-		return mcpmcp.NewToolResultText(response), nil
 	}
+	if nextIndex < 0 {
+		if step.End {
+			nextIndex = len(wf.Steps)
+		} else {
+			nextIndex = wf.NextIndex(state.CurrentIndex + 1)
+		}
+	}
+
+	if nextIndex >= len(wf.Steps) {
+		// Do NOT pre-release the claim — if completeWorkflow's initial
+		// write fails, the deferred release in advanceTool cleans up.
+		res, err := s.completeWorkflow(state)
+		return withNotice(res, notice), err
+	}
+
+	nextStep := wf.Steps[nextIndex]
+	state.CurrentStep = nextStep.ID
+	state.CurrentIndex = nextIndex
+	state.StepType = stepType(nextStep)
+	state.StepEnforce = engine.EffectiveEnforce(*wf, nextStep)
+	state.Busy = false
+	if err := lib.WriteSessionJSON(s.dataDir, state); err != nil {
+		return mcpmcp.NewToolResultError(fmt.Sprintf("write state: %v", err)), nil
+	}
+	return mcpmcp.NewToolResultText(notice + s.formatStepResponse(wf, state, &nextStep, state.Input)), nil
+}
+
+// withNotice prepends notice to a text result.
+func withNotice(res *mcpmcp.CallToolResult, notice string) *mcpmcp.CallToolResult {
+	if notice == "" || res == nil || len(res.Content) == 0 {
+		return res
+	}
+	if tc, ok := res.Content[0].(mcpmcp.TextContent); ok {
+		tc.Text = notice + tc.Text
+		res.Content[0] = tc
+	}
+	return res
+}
+
+// haltWorkflow ends a session that cannot continue safely (e.g. a
+// gated loop ran out of iterations with its gate still failing). The
+// session slot is freed and the DB row records why.
+func (s *Server) haltWorkflow(state *lib.SessionState, status, reason string) (*mcpmcp.CallToolResult, error) {
+	var warnings []string
+	// Persist the terminal status first (like completeWorkflow), so a
+	// failed clear below leaves a non-running session the guards and
+	// devkit_advance will not treat as live.
+	state.Status = status
+	state.Busy = false
+	if err := lib.WriteSessionJSON(s.dataDir, state); err != nil {
+		warnings = append(warnings, fmt.Sprintf("write halted state failed: %v", err))
+	}
+	if s.db != nil {
+		if err := s.db.UpdateSessionStatus(state.ID, status); err != nil {
+			warnings = append(warnings, fmt.Sprintf("db session status update failed: %v", err))
+		}
+	}
+	if err := lib.ClearSessionJSON(s.dataDir); err != nil {
+		warnings = append(warnings, fmt.Sprintf("clear session state failed: %v", err))
+	}
+	msg := fmt.Sprintf("=== WORKFLOW HALTED (%s) ===\nSession: %s\nStep: %s\n%s", status, state.ID, state.CurrentStep, reason)
+	for _, w := range warnings {
+		msg += "\nwarning: " + w
+	}
+	return mcpmcp.NewToolResultError(msg), nil
 }
 
 // completeWorkflow marks a session as done, updates DB, and clears hot state.
@@ -584,10 +734,14 @@ func (s *Server) runCommandWithTimeout(ctx context.Context, command string, stat
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = s.repoRoot
 	cmd.Env = append(os.Environ(), commandEnv(state)...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	err := cmd.Run()
+	configureCommandProcess(cmd)
+	// Backstop: if the process is still alive commandWaitDelay after
+	// Cancel ran, Go SIGKILLs it directly so Wait cannot block forever.
+	cmd.WaitDelay = commandWaitDelay
+	output, err, startErr, truncated := runDrained(cmd, commandWaitDelay)
+	if startErr != nil {
+		return "", 1, fmt.Errorf("command execution failed: %w", startErr)
+	}
 	// Timeout must be checked BEFORE the exec.ExitError branch —
 	// on Unix, CommandContext kills the process with SIGKILL when
 	// the deadline fires, and that surfaces as an *exec.ExitError
@@ -596,7 +750,16 @@ func (s *Server) runCommandWithTimeout(ctx context.Context, command string, stat
 	// so timeouts were reported as "exit code -1" instead of the
 	// promised exit 124 with a clear timeout message.
 	if ctx.Err() == context.DeadlineExceeded {
-		return out.String(), 124, fmt.Errorf("command timed out after %s", timeout)
+		return output, 124, fmt.Errorf("command timed out after %s", timeout)
+	}
+	// Truncated: the shell exited (with ANY code) but a leftover
+	// background child still held the output pipe after
+	// commandWaitDelay. The captured output is incomplete — the child
+	// could still print FAIL after a PASS we already captured — so fail
+	// closed rather than let expect/require/gate checks judge it.
+	// runDrained has already killed the leftovers.
+	if truncated {
+		return output, 1, fmt.Errorf("command exited but a background process still held its output after %s; output is incomplete (redirect or wait for background jobs)", commandWaitDelay)
 	}
 	exitCode := 0
 	if err != nil {
@@ -608,10 +771,10 @@ func (s *Server) runCommandWithTimeout(ctx context.Context, command string, stat
 			// permission denied). Surface whatever the command
 			// produced on its combined stream so the user sees
 			// the real cause, not just the Go wrapper.
-			return out.String(), 1, fmt.Errorf("command execution failed: %w", err)
+			return output, 1, fmt.Errorf("command execution failed: %w", err)
 		}
 	}
-	return out.String(), exitCode, nil
+	return output, exitCode, nil
 }
 
 // commandEnv returns the DEVKIT_INPUT and DEVKIT_OUT_<id> env vars that
@@ -633,7 +796,7 @@ func commandEnv(state *lib.SessionState) []string {
 // through the same function the validator uses.
 func sanitizeEnvKey(id string) string { return engine.EnvKey(id) }
 
-func (s *Server) handleLoopAdvance(ctx context.Context, wf *engine.Workflow, state *lib.SessionState, step *engine.WfStep, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
+func (s *Server) handleLoopAdvance(ctx context.Context, wf *engine.Workflow, state *lib.SessionState, step *engine.WfStep, freshOutput bool) (*mcpmcp.CallToolResult, error) {
 	// Initialize loop tracking on first call
 	if state.LoopMax == 0 {
 		state.LoopMax = step.Loop.Max
@@ -643,35 +806,48 @@ func (s *Server) handleLoopAdvance(ctx context.Context, wf *engine.Workflow, sta
 	}
 	state.LoopIteration++
 
-	// Check gate command if present. Gate strings are also literal —
-	// values come via env vars DEVKIT_INPUT / DEVKIT_OUT_<step_id>.
-	// Gates get a shorter independent timeout so a wedged gate cannot
-	// eat the full command budget.
+	// A loop completes when its gate (if any) passes AND its until
+	// sentinel (if any) appears in this iteration's output. A failing
+	// gate is objective evidence the work is broken, so the agent's
+	// "DONE" never overrides it. Gate strings are literal — values come
+	// via env vars DEVKIT_INPUT / DEVKIT_OUT_<step_id>. Gates get a
+	// shorter independent timeout so a wedged gate cannot eat the full
+	// command budget.
+	hasCondition := step.Loop.Gate != "" || step.Loop.Until != ""
+	gatePassed := true
+	gateNote := ""
 	if step.Loop.Gate != "" {
 		gateOut, exitCode, err := s.runCommandWithTimeout(ctx, step.Loop.Gate, state, gateTimeout)
 		if err != nil {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("gate command failed: %v\n%s", err, gateOut)), nil
 		}
-		if exitCode == 0 {
-			// Gate passed — advance past loop
-			return s.advancePastLoop(wf, state)
+		if exitCode != 0 {
+			gatePassed = false
+			gateNote = fmt.Sprintf("GATE FAILED (exit %d): %s\n%s\n\n", exitCode, step.Loop.Gate, tailString(gateOut, 4000))
 		}
-		// Gate failed — continue loop
 	}
-
-	// Check "until" condition. Line-anchored match (see engine.MatchUntil)
-	// so sentinels like "DONE" do not match prose mentions.
+	untilMet := true
 	if step.Loop.Until != "" {
-		if output, ok := state.Outputs[step.ID]; ok {
-			if engine.MatchUntil(output, step.Loop.Until) {
-				return s.advancePastLoop(wf, state)
-			}
-		}
+		// Line-anchored match (see engine.MatchUntil).
+		output, ok := state.Outputs[step.ID]
+		untilMet = freshOutput && ok && engine.MatchUntil(output, step.Loop.Until)
+	}
+	if hasCondition && gatePassed && untilMet {
+		return s.advancePastLoop(wf, state, step, "")
 	}
 
-	// Check max iterations
 	if state.LoopIteration >= state.LoopMax {
-		return s.advancePastLoop(wf, state)
+		if !hasCondition {
+			return s.advancePastLoop(wf, state, step, "")
+		}
+		if !gatePassed {
+			return s.haltWorkflow(state, "loop_exhausted", fmt.Sprintf(
+				"Loop %s ran %d/%d iterations and its gate is still failing — stopping instead of continuing on broken work.\n%s",
+				step.ID, state.LoopIteration, state.LoopMax, gateNote))
+		}
+		notice := fmt.Sprintf("=== LOOP EXHAUSTED: %s ran %d/%d iterations without %q — continuing, but treat its result as unverified. ===\n\n",
+			step.ID, state.LoopIteration, state.LoopMax, step.Loop.Until)
+		return s.advancePastLoop(wf, state, step, notice)
 	}
 
 	// Continue loop — return same step for another iteration.
@@ -685,40 +861,53 @@ func (s *Server) handleLoopAdvance(ctx context.Context, wf *engine.Workflow, sta
 		return mcpmcp.NewToolResultError(fmt.Sprintf("write loop state: %v", err)), nil
 	}
 	response := fmt.Sprintf("=== LOOP ITERATION %d/%d: %s ===\n", state.LoopIteration, state.LoopMax, step.ID)
+	response += gateNote
 	response += s.formatStepResponse(wf, state, step, state.Input)
 	return mcpmcp.NewToolResultText(response), nil
 }
 
-func (s *Server) advancePastLoop(wf *engine.Workflow, state *lib.SessionState) (*mcpmcp.CallToolResult, error) {
-	nextIndex := state.CurrentIndex + 1
-	// Reset loop state
+func (s *Server) advancePastLoop(wf *engine.Workflow, state *lib.SessionState, step *engine.WfStep, notice string) (*mcpmcp.CallToolResult, error) {
+	// Reset loop state, then transition like any other step so branch
+	// rules and end: true apply to loop steps too.
 	state.LoopIteration = 0
 	state.LoopMax = 0
-
-	if nextIndex >= len(wf.Steps) {
-		return s.completeWorkflow(state)
-	}
-
-	nextStep := wf.Steps[nextIndex]
-	state.CurrentStep = nextStep.ID
-	state.CurrentIndex = nextIndex
-	state.StepType = stepType(nextStep)
-	state.StepEnforce = engine.EffectiveEnforce(*wf, nextStep)
-	state.Busy = false
-	if err := lib.WriteSessionJSON(s.dataDir, state); err != nil {
-		return mcpmcp.NewToolResultError(fmt.Sprintf("write state: %v", err)), nil
-	}
-
-	response := s.formatStepResponse(wf, state, &nextStep, state.Input)
-	return mcpmcp.NewToolResultText(response), nil
+	return s.transition(wf, state, step, notice)
 }
+
+// tailString returns the last n bytes of s (prefixed with "…" if cut).
+func tailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
+}
+
+// askMaxDepth bounds devkit_ask nesting. The handler refuses to run when
+// DEVKIT_ASK_DEPTH in its own environment has reached the limit, and it
+// launches every peer with DEVKIT_ASK_DEPTH incremented, so a peer that
+// has the devkit MCP server loaded cannot ask onward and two hosts cannot
+// ping-pong until the timeout fires.
+const askMaxDepth = 1
+
+// askDepthEnv carries the devkit_ask nesting depth down the process tree:
+// MCP server → peer CLI → that peer's own devkit MCP server.
+const askDepthEnv = "DEVKIT_ASK_DEPTH"
+
+// askMaxTimeout caps the optional devkit_ask timeout argument. The default
+// when the argument is omitted is commandTimeout.
+const askMaxTimeout = 30 * time.Minute
+
+// askDetectRunners is the peer discovery used by devkit_ask; tests swap it
+// to inject fake peers.
+var askDetectRunners = runners.DetectRunners
 
 func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 	tool := mcpmcp.NewTool("devkit_ask",
-		mcpmcp.WithDescription("Send a prompt to a peer AI CLI (claude, codex, or agy) and return its answer synchronously. The direct, commutative bridge primitive: any MCP host can ask any peer and block for the reply."),
+		mcpmcp.WithDescription("Send a prompt to a peer AI CLI (claude, codex, or agy) and return its answer synchronously. The direct, commutative bridge primitive: any MCP host can ask any peer and block for the reply. Nesting is refused: a peer launched by devkit_ask cannot call devkit_ask itself."),
 		mcpmcp.WithString("to", mcpmcp.Required(), mcpmcp.Description("Target peer: claude, codex, or agy")),
 		mcpmcp.WithString("prompt", mcpmcp.Required(), mcpmcp.Description("The prompt to send to the peer")),
-		mcpmcp.WithString("workdir", mcpmcp.Description("Working directory for the peer (optional)")),
+		mcpmcp.WithString("workdir", mcpmcp.Description("Working directory for the peer (optional; must be an existing directory)")),
+		mcpmcp.WithNumber("timeout", mcpmcp.Description(fmt.Sprintf("Seconds to wait for the peer's answer (optional; default %d, max %d)", int(commandTimeout.Seconds()), int(askMaxTimeout.Seconds())))),
 	)
 	return tool, func(ctx context.Context, req mcpmcp.CallToolRequest) (*mcpmcp.CallToolResult, error) {
 		to, err := req.RequireString("to")
@@ -728,12 +917,6 @@ func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		prompt, err := req.RequireString("prompt")
 		if err != nil {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("missing argument: %v", err)), nil
-		}
-		workdir := ""
-		if args := req.GetArguments(); args != nil {
-			if w, ok := args["workdir"].(string); ok {
-				workdir = w
-			}
 		}
 
 		to = strings.ToLower(strings.TrimSpace(to))
@@ -745,18 +928,46 @@ func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("unknown peer %q: want claude, codex, or agy", to)), nil
 		}
 
-		peer := runners.FindRunner(to, runners.DetectRunners())
+		// Validate every argument before touching PATH or spawning anything.
+		workdir := strings.TrimSpace(req.GetString("workdir", ""))
+		if workdir != "" {
+			info, statErr := os.Stat(workdir)
+			if statErr != nil {
+				return mcpmcp.NewToolResultError(fmt.Sprintf("workdir %q: %v", workdir, statErr)), nil
+			}
+			if !info.IsDir() {
+				return mcpmcp.NewToolResultError(fmt.Sprintf("workdir %q is not a directory", workdir)), nil
+			}
+		}
+		timeout, err := askTimeout(req)
+		if err != nil {
+			return mcpmcp.NewToolResultError(err.Error()), nil
+		}
+		depth, err := askDepth()
+		if err != nil {
+			return mcpmcp.NewToolResultError(err.Error()), nil
+		}
+
+		peer := runners.FindRunner(to, askDetectRunners())
 		if peer == nil {
 			return mcpmcp.NewToolResultError(fmt.Sprintf("peer %q is not available — check it is installed and on PATH", to)), nil
 		}
 
 		// Bound the synchronous call so a wedged peer cannot hang the MCP
 		// request forever; parent cancellation still propagates.
-		ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		res, runErr := peer.Run(ctx, prompt, runners.RunOpts{WorkDir: workdir})
+		res, runErr := peer.Run(ctx, prompt, runners.RunOpts{
+			WorkDir: workdir,
+			// The peer (and any devkit MCP server it loads) sees the
+			// incremented depth and refuses to ask further.
+			Env: []string{fmt.Sprintf("%s=%d", askDepthEnv, depth+1)},
+		})
 		if runErr != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return mcpmcp.NewToolResultError(fmt.Sprintf("%s timed out after %s", to, timeout)), nil
+			}
 			// Surface exit code + whatever the peer produced so the caller
 			// sees the real failure, not just the Go wrapper message.
 			detail := res.Output
@@ -769,4 +980,44 @@ func (s *Server) askTool() (mcpmcp.Tool, mcpgo.ToolHandlerFunc) {
 		}
 		return mcpmcp.NewToolResultText(res.Output), nil
 	}
+}
+
+// askTimeout resolves the optional timeout argument (seconds) to a
+// duration: commandTimeout when omitted, otherwise a positive value no
+// larger than askMaxTimeout.
+func askTimeout(req mcpmcp.CallToolRequest) (time.Duration, error) {
+	raw, present := req.GetArguments()["timeout"]
+	if !present || raw == nil {
+		return commandTimeout, nil
+	}
+	secs, err := req.RequireFloat("timeout")
+	if err != nil {
+		return 0, fmt.Errorf("invalid timeout: %v", err)
+	}
+	if math.IsNaN(secs) || math.IsInf(secs, 0) || secs <= 0 {
+		return 0, fmt.Errorf("invalid timeout %v: must be a positive number of seconds", secs)
+	}
+	// Compare before converting so an absurd value cannot overflow Duration.
+	if secs > askMaxTimeout.Seconds() {
+		return 0, fmt.Errorf("timeout %vs exceeds maximum %ds", secs, int(askMaxTimeout.Seconds()))
+	}
+	return time.Duration(secs * float64(time.Second)), nil
+}
+
+// askDepth reads DEVKIT_ASK_DEPTH from this process's environment and
+// refuses once the limit is reached. A malformed value is refused too:
+// it means something upstream tampered with the guard.
+func askDepth() (int, error) {
+	raw := strings.TrimSpace(os.Getenv(askDepthEnv))
+	if raw == "" {
+		return 0, nil
+	}
+	depth, err := strconv.Atoi(raw)
+	if err != nil || depth < 0 {
+		return 0, fmt.Errorf("invalid %s=%q: expected a non-negative integer", askDepthEnv, raw)
+	}
+	if depth >= askMaxDepth {
+		return 0, fmt.Errorf("nested devkit_ask refused (%s=%d): a peer launched by devkit_ask may not ask another peer", askDepthEnv, depth)
+	}
+	return depth, nil
 }

@@ -2,12 +2,14 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/5uck1ess/devkit/lib"
@@ -1711,5 +1713,356 @@ func TestInterpolateDeterministic(t *testing.T) {
 		if got != first {
 			t.Fatalf("nondeterministic interpolate: %q vs %q", first, got)
 		}
+	}
+}
+
+// erroringCostRunner fails every call but reports spend, like claude -p
+// hitting max-turns after real work.
+type erroringCostRunner struct{ calls atomic.Int32 }
+
+func (r *erroringCostRunner) Name() string    { return "err-cost" }
+func (r *erroringCostRunner) Available() bool { return true }
+func (r *erroringCostRunner) Run(ctx context.Context, prompt string, opts runners.RunOpts) (runners.RunResult, error) {
+	r.calls.Add(1)
+	return runners.RunResult{CostUSD: 0.50}, errors.New("max turns")
+}
+
+func TestRunWorkflowFailedRunsCountTowardBudget(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	runner := &erroringCostRunner{}
+	eng := mustEngine(t, db, git, runner, dir)
+	wf := &Workflow{Name: "test", Steps: []WfStep{
+		{ID: "fix", Prompt: "Fix", Loop: &Loop{Max: 10, Until: "DONE"}},
+	}}
+	res, _ := eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x", BudgetUSD: 1.00})
+	if n := runner.calls.Load(); n > 2 {
+		t.Errorf("runner called %d times; failed runs' cost must count toward the $1.00 budget (want <= 2)", n)
+	}
+	if res != nil && res.TotalUSD < 1.00 {
+		t.Errorf("TotalUSD = %.2f, want >= 1.00 (failed-run spend dropped)", res.TotalUSD)
+	}
+}
+
+func TestRunWorkflowParallelFailedRunsCountCost(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	eng := mustEngine(t, db, git, &erroringCostRunner{}, dir)
+	wf := &Workflow{Name: "test", Steps: []WfStep{
+		{ID: "a", Prompt: "A"},
+		{ID: "b", Prompt: "B"},
+		{ID: "fan", Parallel: []string{"a", "b"}},
+	}}
+	res, _ := eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x"})
+	if res == nil || res.TotalUSD < 1.00 {
+		t.Fatalf("failed parallel children's spend dropped: %+v", res)
+	}
+}
+
+func TestRunWorkflowLoopRequireFailureCountsTowardBudget(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	responses := make([]runners.RunResult, 10)
+	for i := range responses {
+		responses[i] = runners.RunResult{Output: "no marker", CostUSD: 0.50}
+	}
+	runner := newMockRunner(responses, nil)
+	eng := mustEngine(t, db, git, runner, dir)
+	wf := &Workflow{Name: "test", Steps: []WfStep{
+		{ID: "fix", Prompt: "Fix", Loop: &Loop{Max: 10, Until: "DONE"}, Require: &Require{Contains: []string{"MARKER"}}},
+	}}
+	eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x", BudgetUSD: 1.00})
+	if runner.callIdx > 2 {
+		t.Errorf("runner called %d times; require-failed iterations must count toward the budget", runner.callIdx)
+	}
+}
+
+// editThenFailRunner succeeds on the first call and, on the second, edits a
+// tracked file and then errors — like claude -p writing code and hitting
+// max-turns.
+type editThenFailRunner struct {
+	dir   string
+	calls int
+}
+
+func (r *editThenFailRunner) Name() string    { return "edit-fail" }
+func (r *editThenFailRunner) Available() bool { return true }
+func (r *editThenFailRunner) Run(ctx context.Context, prompt string, opts runners.RunOpts) (runners.RunResult, error) {
+	r.calls++
+	if r.calls == 1 {
+		return runners.RunResult{Output: "progress"}, nil
+	}
+	if err := os.WriteFile(filepath.Join(r.dir, "state.txt"), []byte("bad\n"), 0o644); err != nil {
+		return runners.RunResult{}, err
+	}
+	return runners.RunResult{}, errors.New("error_max_turns")
+}
+
+func TestRunWorkflowLoopRunnerErrorRevertsEdits(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	eng := mustEngine(t, db, git, &editThenFailRunner{dir: dir}, dir)
+	wf := &Workflow{Name: "test", Steps: []WfStep{
+		{ID: "fix", Prompt: "Fix", Loop: &Loop{Max: 2, Until: "DONE"}},
+	}}
+	eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x"})
+	if _, err := os.Stat(filepath.Join(dir, "state.txt")); err == nil {
+		t.Fatal("edits from a failed runner call survived; they must be reverted, never committed")
+	}
+	out, err := exec.Command("git", "-C", dir, "log", "--all", "--name-only", "--format=").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "state.txt") {
+		t.Fatal("unvalidated edit from failed runner call was committed")
+	}
+}
+
+func TestRunWorkflowEndStopsBeforeTrailingSteps(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	runner := newMockRunner([]runners.RunResult{
+		result("BIG change"),
+		result("full path done"),
+	}, nil)
+	eng := mustEngine(t, db, git, runner, dir)
+	wf := &Workflow{
+		Name: "test",
+		Steps: []WfStep{
+			{ID: "triage", Prompt: "Classify {{input}}", Branch: []Branch{{When: "TINY", Goto: "quick"}}},
+			{ID: "full", Prompt: "Full", End: true},
+			{ID: "quick", Prompt: "Quick"},
+		},
+	}
+	res, err := eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x"})
+	if err != nil {
+		t.Fatalf("RunWorkflow: %v", err)
+	}
+	if runner.callIdx != 2 {
+		t.Errorf("runner called %d times, want 2 (quick must not run after end)", runner.callIdx)
+	}
+	if _, ok := res.Outputs["quick"]; ok {
+		t.Error("quick ran after an end: true step")
+	}
+}
+
+func TestValidateRejectsUnsupportedParallelChildren(t *testing.T) {
+	base := func(child WfStep) *Workflow {
+		return &Workflow{Name: "w", Steps: []WfStep{
+			{ID: "fan", Parallel: []string{"c"}},
+			child,
+			{ID: "after", Prompt: "after"},
+		}}
+	}
+	cases := map[string]WfStep{
+		"command child": {ID: "c", Command: "true"},
+		"loop child":    {ID: "c", Prompt: "p", Loop: &Loop{Max: 2}},
+		"branch child":  {ID: "c", Prompt: "p", Branch: []Branch{{When: "X", Goto: "after"}}},
+		"end child":     {ID: "c", Prompt: "p", End: true},
+	}
+	for name, child := range cases {
+		if err := base(child).Validate(); err == nil {
+			t.Errorf("%s: expected validation error", name)
+		}
+	}
+	// goto into a parallel child would be silently skipped by the walk.
+	wf := &Workflow{Name: "w", Steps: []WfStep{
+		{ID: "t", Prompt: "t", Branch: []Branch{{When: "X", Goto: "c"}}},
+		{ID: "c", Prompt: "c"},
+		{ID: "fan", Parallel: []string{"c"}},
+	}}
+	if err := wf.Validate(); err == nil {
+		t.Error("branch goto targeting a parallel child should be rejected")
+	}
+}
+
+func TestNextIndexSkipsParallelChildren(t *testing.T) {
+	wf := &Workflow{Name: "w", Steps: []WfStep{
+		{ID: "a", Prompt: "a"},
+		{ID: "b", Prompt: "b"},
+		{ID: "fan", Parallel: []string{"a", "b"}},
+		{ID: "z", Prompt: "z"},
+	}}
+	if got := wf.NextIndex(0); got != 2 {
+		t.Errorf("NextIndex(0) = %d, want 2", got)
+	}
+	if got := wf.NextIndex(3); got != 3 {
+		t.Errorf("NextIndex(3) = %d, want 3", got)
+	}
+	if got := wf.NextIndex(4); got != 4 {
+		t.Errorf("NextIndex(4) = %d, want 4 (past end)", got)
+	}
+}
+
+// The full paths of feature and bugfix must stop at their report step
+// instead of falling through into the TINY quick-fix step placed last.
+func TestShippedWorkflowsFullPathEndsBeforeQuickFix(t *testing.T) {
+	for wfFile, terminal := range map[string]string{
+		"feature.yml": "final-report",
+		"bugfix.yml":  "summary",
+	} {
+		wf, err := ParseFile(filepath.Join("..", "..", "workflows", wfFile))
+		if err != nil {
+			t.Fatalf("%s: %v", wfFile, err)
+		}
+		var found bool
+		for i, s := range wf.Steps {
+			if s.ID != terminal {
+				continue
+			}
+			found = true
+			if !s.End {
+				t.Errorf("%s: step %q must set end: true", wfFile, terminal)
+			}
+			if i+1 >= len(wf.Steps) || wf.Steps[i+1].ID != "quick-fix" {
+				t.Errorf("%s: expected quick-fix right after %q", wfFile, terminal)
+			}
+		}
+		if !found {
+			t.Errorf("%s: step %q not found", wfFile, terminal)
+		}
+	}
+}
+
+func TestRunWorkflowEndOnParallelDispatcher(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	runner := newMockRunner([]runners.RunResult{
+		result("a out"), result("b out"), result("must not run"),
+	}, nil)
+	eng := mustEngine(t, db, git, runner, dir)
+	wf := &Workflow{Name: "test", Steps: []WfStep{
+		{ID: "a", Prompt: "A"},
+		{ID: "b", Prompt: "B"},
+		{ID: "fan", Parallel: []string{"a", "b"}, End: true},
+		{ID: "trailing", Prompt: "T"},
+	}}
+	res, err := eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x"})
+	if err != nil {
+		t.Fatalf("RunWorkflow: %v", err)
+	}
+	if _, ok := res.Outputs["trailing"]; ok {
+		t.Error("trailing step ran after an end: true dispatcher")
+	}
+}
+
+func TestEffectiveEnforceParallelDispatcherInheritsSoftChildren(t *testing.T) {
+	wf := Workflow{Name: "w", Enforce: EnforceHard, Steps: []WfStep{
+		{ID: "a", Prompt: "a", Enforce: EnforceSoft},
+		{ID: "b", Prompt: "b"},
+		{ID: "fan", Parallel: []string{"a", "b"}},
+		{ID: "fan-hard", Parallel: []string{"b"}},
+		{ID: "fan-pinned", Parallel: []string{"a"}, Enforce: EnforceHard},
+	}}
+	if got := EffectiveEnforce(wf, wf.Steps[2]); got != EnforceSoft {
+		t.Errorf("dispatcher with a soft child = %q, want soft (children need their tools)", got)
+	}
+	if got := EffectiveEnforce(wf, wf.Steps[3]); got != EnforceHard {
+		t.Errorf("dispatcher with only hard children = %q, want hard", got)
+	}
+	if got := EffectiveEnforce(wf, wf.Steps[4]); got != EnforceHard {
+		t.Errorf("explicit enforce on dispatcher = %q, want hard", got)
+	}
+}
+
+func TestValidateRejectsBranchOnParallelDispatcher(t *testing.T) {
+	wf := &Workflow{Name: "w", Steps: []WfStep{
+		{ID: "fan", Parallel: []string{"c"}, Branch: []Branch{{When: "X", Goto: "after"}}},
+		{ID: "c", Prompt: "c"},
+		{ID: "after", Prompt: "after"},
+	}}
+	if err := wf.Validate(); err == nil {
+		t.Error("branch on a parallel dispatcher should be rejected (CLI never evaluates it)")
+	}
+}
+
+// A failed loop iteration must roll back only its own edits, not
+// uncommitted output from steps that ran before the loop.
+func TestRunWorkflowLoopRollbackKeepsEarlierStepWork(t *testing.T) {
+	cases := map[string]struct {
+		runner *mockRunner
+		gate   string
+	}{
+		"runner error": {
+			runner: newMockRunner([]runners.RunResult{{}, result("DONE")}, []error{errors.New("exit 1"), nil}),
+		},
+		"gate failure": {
+			runner: newMockRunner([]runners.RunResult{result("try"), result("DONE")}, nil),
+			gate:   `test -f gate-ok || { touch gate-ok; exit 1; }`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			db := tempDB(t)
+			dir, git := initGitRepo(t)
+			if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("gate-ok\n.devkit/\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			eng := mustEngine(t, db, git, tc.runner, dir)
+			wf := &Workflow{Name: "test", Steps: []WfStep{
+				{ID: "prep", Command: "printf good > state.txt"},
+				{ID: "fix", Prompt: "Fix", Loop: &Loop{Max: 2, Until: "DONE", Gate: tc.gate}},
+			}}
+			if _, err := eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x"}); err != nil {
+				t.Fatalf("RunWorkflow: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "state.txt"))
+			if err != nil || string(got) != "good" {
+				t.Fatalf("earlier step's state.txt lost by loop rollback: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+// funcRunner adapts a function to runners.Runner.
+type funcRunner func() (runners.RunResult, error)
+
+func (f funcRunner) Name() string    { return "func" }
+func (f funcRunner) Available() bool { return true }
+func (f funcRunner) Run(ctx context.Context, prompt string, opts runners.RunOpts) (runners.RunResult, error) {
+	return f()
+}
+
+// A repair loop must still start when a pre-commit hook rejects the state
+// it is meant to repair — rollback protection must not depend on commits.
+func TestRunWorkflowRepairLoopRunsDespiteRejectingPreCommitHook(t *testing.T) {
+	db := tempDB(t)
+	dir, git := initGitRepo(t)
+	gitIn := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s", args, out)
+		}
+	}
+	write := func(name, body string, mode os.FileMode) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".gitignore", ".devkit/\n", 0o644)
+	write("state.txt", "good", 0o644)
+	gitIn("add", "-A")
+	gitIn("commit", "-m", "state")
+	write(filepath.Join(".git", "hooks", "pre-commit"), "#!/bin/sh\ntest \"$(cat state.txt)\" = good\n", 0o755)
+
+	calls := 0
+	repair := funcRunner(func() (runners.RunResult, error) {
+		calls++
+		write("state.txt", "good", 0o644)
+		return result("DONE"), nil
+	})
+	eng := mustEngine(t, db, git, repair, dir)
+	wf := &Workflow{Name: "test", Steps: []WfStep{
+		{ID: "break", Command: "printf bad > state.txt"},
+		{ID: "repair", Prompt: "Fix", Loop: &Loop{Max: 2, Until: "DONE"}},
+	}}
+	if _, err := eng.RunWorkflow(context.Background(), wf, RunConfig{Input: "x"}); err != nil {
+		t.Fatalf("RunWorkflow: %v", err)
+	}
+	if calls == 0 {
+		t.Fatal("repair loop never ran")
 	}
 }

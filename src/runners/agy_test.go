@@ -17,24 +17,33 @@ func TestAgyExecArgs(t *testing.T) {
 		want    []string
 	}{
 		{
+			// --print must stay last: a valueless --print followed by
+			// another flag swallowed that flag as the prompt on some
+			// releases (fixed in v1.5.2 release notes).
 			name: "default no workdir",
-			want: []string{"exec", "-"},
+			want: []string{"--dangerously-skip-permissions", "--print"},
 		},
 		{
+			// agy has no cwd flag; WorkDir is applied via cmd.Dir only.
 			name:    "default with workdir",
 			workDir: "/tmp/repo",
-			want:    []string{"exec", "-C", "/tmp/repo", "-"},
+			want:    []string{"--dangerously-skip-permissions", "--print"},
 		},
 		{
 			name:    "AGY_ARGS override with workdir token",
-			agyArgs: "run --cwd {workdir} -",
+			agyArgs: "--add-dir {workdir} --print",
 			workDir: "/tmp/repo",
-			want:    []string{"run", "--cwd", "/tmp/repo", "-"},
+			want:    []string{"--add-dir", "/tmp/repo", "--print"},
 		},
 		{
-			name:    "AGY_ARGS override drops workdir token when unset",
-			agyArgs: "run --cwd {workdir} -",
-			want:    []string{"run", "--cwd", "-"},
+			name:    "AGY_ARGS override expands workdir token to . when unset",
+			agyArgs: "--add-dir {workdir} --print",
+			want:    []string{"--add-dir", ".", "--print"},
+		},
+		{
+			name:    "AGY_ARGS override without token",
+			agyArgs: "  --dangerously-skip-permissions --sandbox --print  ",
+			want:    []string{"--dangerously-skip-permissions", "--sandbox", "--print"},
 		},
 	}
 
@@ -73,4 +82,44 @@ func TestAgyAvailableFalseWhenBinaryMissing(t *testing.T) {
 	if r.Available() {
 		t.Error("Available() = true for a nonexistent binary, want false")
 	}
+}
+
+func TestAgyOutputIsError(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"observed print-timeout", "Error: timed out waiting for response", true},
+		{"hypothetical print timeout", "Error: print timeout", true},
+		{"auth failure", "Error: authentication failed: no credentials", true},
+		{"leading and trailing whitespace", "  Error: rate limited\n", true},
+
+		{"model discussing errors (multi-paragraph)", "Error: NullPointerException at line 42\n\nThe root cause is the nil dereference in handleRequest()...", false},
+		{"long model response starting with Error:", "Error: " + longString(400), false},
+		{"Error: mid-body, not at prefix", "Here's a review.\n\nError: this is a discussion of error handling.", false},
+		{"empty output", "", false},
+		{"whitespace only", "   \n  \t  ", false},
+		{"lowercase error: is not an agy error", "error: lowercase from a model response", false},
+		{"uppercase ERROR: is not matched (case-sensitive)", "ERROR: yelling", false},
+		{"Error- with dash, not colon", "Error- not the right delimiter", false},
+		{"plain success output", "ok", false},
+		{"multi-line model output", "Here is my review:\n- point 1\n- point 2", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := agyOutputIsError(tt.output); got != tt.want {
+				t.Errorf("agyOutputIsError(%q) = %v, want %v", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
+func longString(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 'x'
+	}
+	return string(b)
 }
